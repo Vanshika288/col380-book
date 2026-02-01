@@ -1,0 +1,363 @@
+\setlength{\emergencystretch}{3em}
+
+\chapter{OpenMP Primitives I: Fork--Join Parallelism and Data Races}
+
+\section{Learning outcomes}
+% Credits: Vani Gupta (2023CS10126)
+
+After this lecture, one should be able to:
+\begin{itemize}
+  \item Explain the difference between \emph{data-based} and \emph{task-based} parallelism, and relate them to SIMD/MIMD.
+  \item Understand OpenMP as an API (C/C++/Fortran bindings) and its default \emph{fork--join} execution model.
+  \item Write and compile a minimal OpenMP program using \ppinline{\#pragma omp parallel} and \ppinline{\#pragma omp parallel for}.
+  \item Predict and explain nondeterministic output in multi-threaded programs (e.g., unordered prints).
+  \item Understand the precise definition of a \emph{data race} and recognize why races may \emph{not} manifest on every run (\emph{Heisenbugs}).
+  \item Fix a simple race by using OpenMP data-sharing clauses such as \ppinline{private} and \ppinline{shared}.
+\end{itemize}
+
+\section{Recap from the previous lecture}
+% Credits: Vanshika (2023CS10746)
+\begin{ppnote}
+: We previously discussed (i) \emph{models of parallelism} (SIMD vs.\ MIMD) and (ii) \emph{modes of communication (shared memory and message passing)}. We also saw our first OpenMP example using \ppinline{\#pragma omp parallel for} to parallelize a data-parallel loop. A key correctness requirement for \ppinline{parallel for} is that the loop must not have cross-iteration dependencies.
+\end{ppnote}
+
+\section{Key takeaways}
+% Credits: Harshit Kansal (2023CS10498)
+\begin{itemize}
+  \item OpenMP directives are \emph{sentinel directives}: \ppinline{\#pragma omp <directive> [clauses]}.
+  \item \ppinline{\#pragma omp parallel} creates a \emph{parallel region} executed by a team of threads.
+  \item \ppinline{\#pragma omp parallel for} distributes loop iterations across threads and has an \emph{implicit barrier} at the end of the loop.
+  \item Default thread count is runtime/architecture dependent; you can control it with \ppinline{OMP\_NUM\_THREADS} or the \ppinline{num\_threads(k)} clause.
+  \item A data race occurs when two concurrent actions access the same memory location and at least one is a write (without proper synchronization).
+  \item Races can be \emph{schedule-dependent}: the program may appear correct until you perturb the schedule (e.g., by inserting \ppinline{sleep()}).
+  \item Fixing races often starts with correct \emph{scoping}: keep thread-local variables \ppinline{private}, and shared variables \ppinline{shared} only when intended.
+\end{itemize}
+
+
+\section{Motivating examples}
+\subsection{Example 1: A data-parallel loop}
+% Credits: Vani Gupta (2023CS10126)
+A typical ''easy win'' in OpenMP is a compute-heavy loop where each iteration is independent. The following example (as in the lecture slides) applies the same function \ppinline{heavy}$(\cdot)$
+to many data items.
+
+\begin{ppnote}
+The slide contains this example as code. See Figure~\ref{fig:slide-parallel-for} for the original slide snapshot.
+\end{ppnote}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.92\linewidth]{chapters/lec4_figs/lec4_p03.png}
+  \caption{Slide snapshot: data-parallel loop parallelized with \ppinline{\#pragma omp parallel for}.}
+  \label{fig:slide-parallel-for}
+\end{figure}
+
+\begin{ppprogram}{Data-parallel loop with \ppinline{omp parallel for}}{prog:omp-parfor-heavy}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+#include <math.h>
+
+static inline double heavy(double x) {
+  for (int k = 0; k < 50; k++) {
+    x = sin(x) + cos(x) + sqrt(x*x + 1.0);
+  }
+  return x;
+}
+
+int main() {
+  const int N = 1000 * 1000;  /* 1 million */
+  /* assume A[] and B[] are allocated and initialized */
+
+  double t1 = omp_get_wtime();
+  #pragma omp parallel for
+  for (int i = 0; i < N; i++) {
+    B[i] = heavy(A[i]);
+  }
+  double t2 = omp_get_wtime();
+
+  double parallel_time = t2 - t1;
+  /* ... */
+  return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\subsection{Example 2: ``Hello World'' parallel region}
+% Credits: Vanshika (2023CS10746)
+The smallest OpenMP program demonstrates that the statements inside a parallel region are executed by \emph{every} thread in the team.
+
+\begin{ppprogram}{A first \ppinline{omp parallel} program}{prog:omp-hello}
+\begin{lstlisting}[language=OpenMP]
+/*Introducing omp parallel */
+
+#include <omp.h> // required header to write OpenMP code
+#include <stdio.h>
+
+int main (){
+  
+  // sentinel directive_name [clause[,clause]...]
+  
+#pragma omp parallel  /* compiler directive */ num_threads(4)
+  {
+    int tid = omp_get_thread_num(); /* Library call */
+    printf("hello world %d \n", tid);
+    
+  } // implicit barrier synchronization here!
+  return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppprogram}{Program output }{out:hello-world}
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+hello world 2
+hello world 4
+hello world 1
+hello world 3
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppnote}
+\textbf{: Compiling }With GCC, compile OpenMP C/C++ code using \ppinline{-fopenmp}:
+\ppinline{gcc -fopenmp omp\_parallel.c -o omp\_parallel}.
+\end{ppnote}
+
+\begin{ppnote}
+\textbf{: Nondeterminism }The printed lines need not appear in order (e.g., thread 6 may print before thread 0). The I/O call itself is not an atomic instruction; the terminal and C library buffering can mask some interleavings (e.g., one does not see "hello hello world"), but you should not rely on print ordering for correctness.
+\end{ppnote}
+
+\subsection{Example 3: A data race that ``sometimes'' shows up}
+% Credits: Harshit Kansal (2023CS10498)
+The lecture used a deliberately buggy program where variables \ppinline{tid} and \ppinline{numt} are declared outside the parallel region, so (by default) they are shared among threads. A sleep is inserted to perturb the schedule and make the race more likely to manifest.
+
+\begin{ppprogram}{Racey program (shared \ppinline{tid} and \ppinline{numt})}{prog:data-race}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+  int tid;
+  int numt;
+
+  #pragma omp parallel num_threads(4)
+  {
+    numt = omp_get_num_threads();
+    tid  = omp_get_thread_num();
+
+    sleep(1);  /* jitter the schedule */
+    printf("hi: %d of %d \n", tid, numt);
+  }
+
+  return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppprogram}{Program output }{out:data-race-jitter}
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+hi: 3 of 4 
+hi: 3 of 4
+hi: 3 of 4
+hi: 3 of 4
+\end{lstlisting}
+\end{ppprogram}
+
+\section{What is OpenMP?}
+% Credits: Rachit Bhalani (2023CS10961)
+OpenMP is an \emph{application programming interface} with language bindings for C, C++ and Fortran. Historically, OpenMP was introduced primarily for fork--join style parallelism; from OpenMP 3.0 onward, it also supports task-based parallelism.
+
+\subsection{Fork--join parallelism}
+In fork--join, execution begins sequentially (e.g., in \ppinline{main}), then a parallel region \emph{forks} into multiple concurrent threads, and finally the threads \emph{join} back at a synchronization point (typically a barrier). After joining, execution continues sequentially. A few points to note are:
+\begin{itemize}
+    \item In fork-join parallelism, the nature of parallelism is known apriori.
+    \item Fork--join parallelism can represent either SIMD or MIMD, depending on what code each thread runs. If each thread executes the same code on different data, it resembles SIMD (data-parallel). If threads execute different tasks, it resembles MIMD (task-based).
+\end{itemize}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.95\linewidth]{chapters/Screenshot 2026-01-29 180317.png}
+  \caption{Fork--join parallelism. Threads fork at a parallel region and join at a barrier.}
+  \label{fig:fork-join}
+\end{figure}
+
+\begin{ppnote}
+\textbf{ (Barrier intuition):} A barrier enforces: ``do not let the program proceed past this point until all threads have arrived here.'' In OpenMP, many constructs (such as \ppinline{parallel for}) include an \emph{implicit} barrier at the end unless \ppinline{nowait} is specified.
+\end{ppnote}
+
+\subsection{Task-based parallelism vs Python's os.subprocess}
+As an aside, we point out the difference between task-based parallelism and Python's \ppinline{os.subprocess}. A subprocess creates a new \emph{process} with a separate address space (process isolation). In contrast, OpenMP parallelism creates multiple \emph{threads} within the \emph{same} process:
+\begin{itemize}
+  \item Threads share the code segment, data segment, and heap of the process.
+  \item Each thread has its own stack.
+\end{itemize}
+
+
+\section{OpenMP directives and regions}
+% Credits: Sabhya Arora (2023CS11177)
+\subsection{Sentinel directives and clauses}
+OpenMP uses compiler directives of the form:
+\[
+\text{\ppinline{\#pragma omp}}~\langle\text{directive}\rangle~[\langle\text{clauses}\rangle].
+\]
+For example, the directive name might be \ppinline{parallel} or \ppinline{parallel for}, followed by optional clauses (such as \ppinline{num\_threads(4)}, \ppinline{private(tid)}, etc.).
+
+\subsection{\ppinline{\#pragma omp parallel for} as two directives}
+The combined form
+\ppinline{\#pragma omp parallel for}
+can be rewritten conceptually as:
+\begin{itemize}
+  \item \ppinline{\#pragma omp parallel} to start a parallel region, and inside it,
+  \item \ppinline{\#pragma omp for} to distribute loop iterations among the threads.
+\end{itemize}
+The \ppinline{parallel for} construct is active only for the associated loop; once the loop ends, threads synchronize (implicit barrier) and the program continues.
+
+\subsection{How many threads?}
+If you do not specify a thread count, OpenMP selects a default (often related to core count and runtime settings). You can override it in two common ways:
+\begin{itemize}
+  \item Environment variable: \ppinline{OMP\_NUM\_THREADS=4}.
+  \item Clause on a parallel region: \ppinline{num\_threads(4)}.
+\end{itemize}
+
+\section{Data races and ``Heisenbugs''}
+% Credits: Rachit Bhalani (2023CS10961)
+\subsection{Definition}
+The following is a practical definition of a data race:
+
+\begin{ppnote}
+\textbf{: Data race (informal but precise).} A data race occurs when there are two concurrent actions accessing the same memory location, and at least one of the accesses is a write, \emph{without} adequate synchronization that orders the accesses.
+\end{ppnote}
+
+
+\begin{ppprogram}{Racey program (shared \ppinline{tid} and \ppinline{numt})}{prog:data-race-wo-jitter}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+  int tid;
+  int numt;
+
+  #pragma omp parallel num_threads(4)
+  {
+    numt = omp_get_num_threads();
+    tid  = omp_get_thread_num();
+    printf("hi: %d of %d \n", tid, numt);
+  }
+
+  return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppprogram}{Program output }{out:data-race-wo-jitter}
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+hi: 1 of 4 
+hi: 0 of 4
+hi: 3 of 4
+hi: 2 of 4
+\end{lstlisting}
+\end{ppprogram}
+
+
+\subsection{Why races may not show up every time}
+A core takeaway is that concurrency bugs are schedule-dependent: a race can exist in the code but fail to manifest on a given execution. Such issues are known as \emph{Heisenbugs} (``the schedule that triggers the bug may be rare'').
+
+One way to make a race manifest is to \emph{jitter} the schedule, e.g., by adding \ppinline{sleep(1)} or other delays so that different interleavings occur (See Program~\ref{prog:data-race})
+
+\subsection{Write--write races and ``benign'' races}
+One important point is that a write--write race is harmful when some later computation observes the shared location and depends on its value. If a location is written concurrently but never read afterward, the race can be considered benign with respect to program output (though it is still a sign of unsafe concurrency).
+
+\section{Fixing the race with data-sharing clauses}
+% Credits: Sabhya Arora (2023CS11177)
+The simplest fix in this case is to make \ppinline{tid} thread-local. In OpenMP, we do so using \ppinline{private(tid)} (while optionally keeping \ppinline{numt} shared, since each thread writes the same value). The private or thread local variables lie on each thread's own stack. The variables of the main thread (which are not thread local) are promoted to the data segment so that they can be shared by all threads. 
+
+The following reference code file demonstrates this: 
+
+\begin{ppprogram}{Fixed version using \ppinline{private(tid)} (reference code)}{prog:data-race-fixed}
+\begin{lstlisting}[language=OpenMP]
+/*Exposing data race*/
+#include <stdio.h>
+#include <omp.h>
+#include <unistd.h>
+
+int main (){
+  
+  int numt, tid ;
+  printf("hi: %d of %d with address: %x \n", tid, numt, &tid);
+  
+#pragma omp parallel num_threads (4) shared (numt) private (tid)
+  {
+    numt = omp_get_num_threads();
+    tid = omp_get_thread_num(); sleep(1);
+    printf("hi: %d of %d with address: %x \n", tid, numt, &tid);
+    
+  } // implicit barrier here!
+  printf("hi: %d of %d with address: %x \n", tid, numt, &tid);
+}\end{lstlisting}
+\end{ppprogram}
+
+
+\begin{ppprogram}{Program output (last run)}{out:data-race-fixed}
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+hi: 1 of 1 with address: 6b1caf04
+hi: 2 of 4 with address: 6b5def7c
+hi: 3 of 4 with address: 6b7eaf7c
+hi: 0 of 4 with address: 6b1cae9c
+hi: 1 of 4 with address: 6b3d2f7c
+hi: 1 of 4 with address: 6b1caf04
+\end{lstlisting}
+\end{ppprogram}
+The output of Program~\ref{prog:data-race-fixed} shows that each OpenMP thread
+has a distinct private instance of \ppinline{tid}, as evidenced by different
+memory addresses printed inside the parallel region. In the earlier version of this code, there was no private tid and there was a data race but now the data race is resolved.
+The garbage value observed for \ppinline{tid} outside the parallel region arises
+from reading an uninitialized variable.
+Since the serial code is executed only by the main thread, the address of
+\ppinline{tid} remains unchanged, leading to the same uninitialized value being
+printed before and after the parallel region.
+
+
+\begin{ppnote} 
+\textbf{: Interpretation} When \ppinline{tid} is private, each thread has its own instance (typically on its own stack), so the race on \ppinline{tid} disappears. The address-printing in Program~\ref{prog:data-race-fixed} is an optional experiment to confirm that each thread sees a different address for \ppinline{tid} inside the parallel region.
+\end{ppnote}
+
+% \section{What comes next}
+% This lecture sets up two themes that will be deepened in subsequent classes:
+% \begin{itemize}
+%   \item The OpenMP execution model and synchronization (implicit/explicit barriers, ordering).
+%   \item Scheduling and work distribution (including chunking for \ppinline{for} loops), and then task-based parallelism.
+% \end{itemize}
+
+\section{References and further reading}
+% Credits: Harshit Kansal (2023CS10498)
+\begin{itemize}
+  \item OpenMP Architecture Review Board (ARB): \emph{OpenMP Application Programming Interface Specification}.
+  \href{https://www.openmp.org/specifications/}{(openmp.org/specifications)}
+  \item GCC documentation for \ppinline{-fopenmp}:
+  \href{https://gcc.gnu.org/onlinedocs/gcc/OpenMP.html}{(GCC OpenMP support)}
+  \item Chapman, Jost, and van der Pas: \emph{Using OpenMP: Portable Shared Memory Parallel Programming}.
+  \item Chandra et al.: \emph{Parallel Programming in OpenMP}.
+  \item Herlihy and Shavit: \emph{The Art of Multiprocessor Programming} (for concurrency fundamentals).
+  \item Savage et al.: ``Eraser: A Dynamic Data Race Detector for Multithreaded Programs'' (classic race detection paper).
+\end{itemize}
+
+
+\section{Exercises (with solutions)}
+% Credits: Whole Team
+\begin{ppexercises}
+  \ppexercise{\textbf{Parallel region basics.} Compile and run Program~\ref{prog:omp-hello}. Set \ppinline{OMP\_NUM\_THREADS} to 2, 4, and 8 and observe the output.
+  \par\smallskip\textbf{Solution.} Use \ppinline{export OMP\_NUM\_THREADS=4} (or the equivalent on your shell) and rerun. The number of printed lines should match the thread count. The order of lines can change between runs.}
+
+  \ppexercise{\textbf{Parallel-for barrier.} Explain why \ppinline{\#pragma omp parallel for} has an implicit barrier at the end, and give one situation where you might want to remove it.
+  \par\smallskip\textbf{Solution.} The barrier ensures all iterations complete before the program continues, which is required if later code depends on the loop's results. You might remove it (using \ppinline{nowait}) when subsequent work in the same parallel region is independent and you want to overlap work across threads.}
+
+  \ppexercise{\textbf{Race identification.} In Program~\ref{prog:data-race}, identify which variables participate in a race and why.
+  \par\smallskip\textbf{Solution.} \ppinline{tid} and \ppinline{numt} are written by all threads and then read by \ppinline{printf}. Because they are shared (declared outside the region), multiple threads can write them concurrently; the \ppinline{printf} may observe a value written by another thread.}
+
+  \ppexercise{\textbf{Make the race manifest.} Remove \ppinline{sleep(1)} from Program~\ref{prog:data-race} and run the program 20 times. Then restore \ppinline{sleep(1)} and run again. Explain the difference.
+  \par\smallskip\textbf{Solution.} Without jitter, the race may not manifest frequently because the schedule may keep writes and reads in an order that ``looks correct''. With \ppinline{sleep}, interleavings change and it becomes more likely that the last write to \ppinline{tid} occurs before many threads print, producing repeated or inconsistent thread ids.}
+
+  \ppexercise{\textbf{Chunking preview.} In Program~\ref{prog:omp-parfor-heavy}, what does it mean to ``chunk'' iterations, and why might \ppinline{schedule(static)} with a chunk size help performance?
+  \par\smallskip\textbf{Solution.} Chunking groups consecutive iterations and assigns each group to a thread. Static scheduling with a suitable chunk can reduce scheduling overhead and improve cache locality. If iteration costs differ, dynamic scheduling may load-balance better but adds overhead.}
+\end{ppexercises}
